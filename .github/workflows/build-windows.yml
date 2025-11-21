@@ -32,7 +32,7 @@ jobs:
         run: npx tsc -p electron/tsconfig.json
 
       - name: Package with Electron Builder
-        run: npx electron-builder
+        run: npx electron-builder --publish=never
         env:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
 
