@@ -23,6 +23,9 @@ jobs:
         env:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
 
+      - name: Compile Electron TypeScript
+        run: npx tsc -p electron/tsconfig.json
+
       - name: Build application
         run: npm run dist
         env:
