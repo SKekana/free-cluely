@@ -29,7 +29,7 @@ jobs:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
 
       - name: Compile Electron TypeScript
-        run: tsc -p electron/tsconfig.json
+        run: npx tsc -p electron/tsconfig.json
 
       - name: Package with Electron Builder
         run: npx electron-builder
