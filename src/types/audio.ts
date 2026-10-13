@@ -1,4 +1,1 @@
-export interface AudioResult {
-  text: string;
-  timestamp: number;
-} 
+export type { AnalysisResult as AudioResult } from "../../electron/contracts"

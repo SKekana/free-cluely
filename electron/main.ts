@@ -4,6 +4,11 @@ import { WindowHelper } from "./WindowHelper"
 import { ScreenshotHelper } from "./ScreenshotHelper"
 import { ShortcutsHelper } from "./shortcuts"
 import { ProcessingHelper } from "./ProcessingHelper"
+import { CaptureHelper } from "./CaptureHelper"
+import { LiveHelper } from "./LiveHelper"
+import { SystemAudioCapture } from "./SystemAudioCapture"
+import { PcmMixer } from "./pcm"
+import type { AudioPacket, FramePacket, LiveOptions, ProblemInfo } from "./contracts"
 
 export class AppState {
   private static instance: AppState | null = null
@@ -13,17 +18,19 @@ export class AppState {
   public shortcutsHelper: ShortcutsHelper
   public processingHelper: ProcessingHelper
   private tray: Tray | null = null
+  public captureHelper: CaptureHelper
+  public liveHelper: LiveHelper
+  private mixer?: PcmMixer
+  private mixTimer?: ReturnType<typeof setInterval>
+  private nativeAudio = new SystemAudioCapture()
+  private liveOptions?: LiveOptions
+  private startEpoch = 0
+  private pendingStart?: number
 
   // View management
   private view: "queue" | "solutions" = "queue"
 
-  private problemInfo: {
-    problem_statement: string
-    input_format: Record<string, any>
-    output_format: Record<string, any>
-    constraints: Array<Record<string, any>>
-    test_cases: Array<Record<string, any>>
-  } | null = null // Allow null
+  private problemInfo: ProblemInfo | null = null
 
   private hasDebugged: boolean = false
 
@@ -55,6 +62,14 @@ export class AppState {
     // Initialize ProcessingHelper
     this.processingHelper = new ProcessingHelper(this)
 
+    this.captureHelper = new CaptureHelper(() => this.getMainWindow())
+    this.liveHelper = new LiveHelper(this.processingHelper.getLLMHelper(), event => {
+      if (event.status === "error" || event.status === "idle") this.stopCaptureInputs()
+      if (event.status === "reconnecting") this.mixer?.clear()
+      const window = this.getMainWindow()
+      if (window && !window.isDestroyed()) window.webContents.send("live-event", event)
+    })
+
     // Initialize ShortcutsHelper
     this.shortcutsHelper = new ShortcutsHelper(this)
   }
@@ -65,6 +80,52 @@ export class AppState {
     }
     return AppState.instance
   }
+
+  public async startLive(options: LiveOptions): Promise<{ sessionId: string }> {
+    if (this.pendingStart !== undefined || !["idle", "error"].includes(this.liveHelper.state)) throw new Error("A Live session is already running")
+    const epoch = ++this.startEpoch
+    this.pendingStart = epoch
+    try {
+    if (!options.microphone && !options.systemAudio && !options.screen) throw new Error("Enable at least one capture input")
+    if (!this.processingHelper.getLLMHelper().getConfig().capabilities.live) throw new Error("Live requires a configured Gemini provider")
+    const capabilities = await this.captureHelper.capabilities()
+    if (epoch !== this.startEpoch) throw new Error("Live start canceled")
+    if (options.screen && !capabilities.screen) throw new Error("Screen capture requires a graphical desktop")
+    if (options.systemAudio && !capabilities.systemAudio) throw new Error(capabilities.systemAudioReason || "System audio is unavailable")
+    if (options.screen || (options.systemAudio && process.platform === "win32")) this.captureHelper.select(options.sourceId || "", options.systemAudio)
+    if (options.systemAudio && process.platform === "linux" && !capabilities.systemSources.some(source => source.id === options.systemSourceId)) throw new Error("Select an available system output")
+    const sessionId = await this.liveHelper.start()
+    if (epoch !== this.startEpoch) throw new Error("Live start canceled")
+    this.liveOptions = options
+    this.mixer = new PcmMixer([...(options.microphone ? ["microphone" as const] : []), ...(options.systemAudio ? ["system" as const] : [])])
+    if (options.systemAudio && process.platform === "linux") this.nativeAudio.start(options.systemSourceId!, data => {
+      if (this.liveHelper.state === "active") this.mixer?.push("system", data)
+    }, error => this.liveHelper.fail(new Error(error)))
+    this.mixTimer = setInterval(() => {
+      if (this.liveHelper.state !== "active") { this.mixer?.clear(); return }
+      const data = this.mixer?.take(); if (data) this.liveHelper.sendAudio(data)
+      this.liveHelper.flushFrame()
+    }, 100)
+    return { sessionId }
+    } finally { if (this.pendingStart === epoch) this.pendingStart = undefined }
+  }
+  public receiveAudio(packet: AudioPacket): void {
+    if (packet.sessionId !== this.liveHelper.sessionId || this.liveHelper.state !== "active") return
+    if (packet.source === "microphone" && !this.liveOptions?.microphone) return
+    if (packet.source === "system" && (!this.liveOptions?.systemAudio || process.platform !== "win32")) return
+    if (!["microphone", "system"].includes(packet.source) || !(packet.data instanceof Uint8Array) || packet.data.length > 32000) return
+    this.mixer?.push(packet.source, packet.data)
+  }
+  public receiveFrame(packet: FramePacket): void {
+    if (packet.sessionId !== this.liveHelper.sessionId || !this.liveOptions?.screen) return
+    if (typeof packet.data !== "string" || packet.data.length > 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(packet.data)) return
+    this.liveHelper.sendFrame(packet.data)
+  }
+  private stopCaptureInputs(): void {
+    clearInterval(this.mixTimer); this.mixTimer = undefined
+    this.nativeAudio.stop(); this.mixer?.clear(); this.mixer = undefined; this.liveOptions = undefined
+  }
+  public stopLive(): void { this.startEpoch++; this.pendingStart = undefined; this.stopCaptureInputs(); this.liveHelper.stop(); this.captureHelper.reset() }
 
   // Getters and Setters
   public getMainWindow(): BrowserWindow | null {
@@ -132,13 +193,17 @@ export class AppState {
   }
 
   public clearQueues(): void {
+    this.stopLive()
+    this.processingHelper.cancelOngoingRequests()
     this.screenshotHelper.clearQueues()
 
     // Clear problem info
     this.problemInfo = null
 
-    // Reset view to initial state
+    // Reset view and synchronize the cleared conversation revision with the renderer.
     this.setView("queue")
+    const window = this.getMainWindow()
+    if (window && !window.isDestroyed()) window.webContents.send("llm-config", this.processingHelper.getLLMHelper().getConfig())
   }
 
   // Screenshot management methods
@@ -276,11 +341,14 @@ async function initializeApp() {
 
   app.whenReady().then(() => {
     console.log("App is ready")
+    appState.captureHelper.install()
     appState.createWindow()
     appState.createTray()
     // Register global shortcuts using ShortcutsHelper
     appState.shortcutsHelper.registerGlobalShortcuts()
   })
+
+  app.on("before-quit", () => { appState.stopLive(); appState.processingHelper.cancelOngoingRequests() })
 
   app.on("activate", () => {
     console.log("App activated")

@@ -1,360 +1,231 @@
-import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai"
-import fs from "fs"
+import type { Content, GoogleGenAI, Part } from "@google/genai" with { "resolution-mode": "import" }
+import fs from "node:fs/promises"
+import path from "node:path"
+import { randomUUID } from "node:crypto"
+import { setTimeout as delay } from "node:timers/promises"
+import { DEFAULT_GEMINI_MODEL, DEFAULT_LIVE_MODEL, MAX_CLIP_BYTES } from "./contracts"
+import type { AnalysisResult, ConnectionStatus, LlmConfig, SolutionResult } from "./contracts"
+import { extractedProblemSchema, jsonSchema, solutionSchema } from "./schemas"
+import { audioMime, errorMessage, isTransient, normalizeAudioMime, validateClip } from "./media"
 
-interface OllamaResponse {
-  response: string
-  done: boolean
+export type ClientFactory = (key: string) => Promise<GoogleGenAI>
+const createClient: ClientFactory = async (apiKey) => {
+  const { GoogleGenAI } = await import("@google/genai")
+  return new GoogleGenAI({ apiKey, httpOptions: { apiVersion: "v1beta", timeout: 45000 } })
 }
+const SYSTEM_PROMPT = "You are Wingman AI, a helpful assistant for meetings, questions and coding. Give concise, practical answers and suggested next steps. Provide a brief rationale when useful."
 
 export class LLMHelper {
-  private model: GenerativeModel | null = null
-  private readonly systemPrompt = `You are Wingman AI, a helpful, proactive assistant for any kind of problem or situation (not just coding). For any user input, analyze the situation, provide a clear problem statement, relevant context, and suggest several possible responses or actions the user could take next. Always explain your reasoning. Present your suggestions as a list of options or next steps.`
-  private useOllama: boolean = false
-  private ollamaModel: string = "llama3.2"
-  private ollamaUrl: string = "http://localhost:11434"
+  private apiKey?: string
+  private client?: Promise<GoogleGenAI>
+  private useOllama: boolean
+  private ollamaModel: string
+  private ollamaUrl: string
+  private status: ConnectionStatus
+  private history: Content[] = []
+  private context: string[] = []
+  private images = new Map<string, Promise<AnalysisResult>>()
+  private epoch = 0
+  private chatBusy = false
+  private requests = new Map<string, AbortController>()
+  readonly geminiModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL
+  readonly liveModel = process.env.GEMINI_LIVE_MODEL || DEFAULT_LIVE_MODEL
 
-  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string) {
+  constructor(apiKey?: string, useOllama = false, ollamaModel = "llama3.2", ollamaUrl = "http://localhost:11434", private factory: ClientFactory = createClient) {
+    this.apiKey = apiKey?.trim() || undefined
     this.useOllama = useOllama
-    
-    if (useOllama) {
-      this.ollamaUrl = ollamaUrl || "http://localhost:11434"
-      this.ollamaModel = ollamaModel || "gemma:latest" // Default fallback
-      console.log(`[LLMHelper] Using Ollama with model: ${this.ollamaModel}`)
-      
-      // Auto-detect and use first available model if specified model doesn't exist
-      this.initializeOllamaModel()
-    } else if (apiKey) {
-      const genAI = new GoogleGenerativeAI(apiKey)
-      this.model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" })
-      console.log("[LLMHelper] Using Google Gemini")
-    } else {
-      throw new Error("Either provide Gemini API key or enable Ollama mode")
+    this.ollamaModel = ollamaModel
+    this.ollamaUrl = ollamaUrl
+    this.status = this.getCurrentProvider() === "unconfigured" ? "unconfigured" : "configured"
+  }
+  getConfig(): LlmConfig {
+    const provider = this.getCurrentProvider()
+    const gemini = provider === "gemini"
+    return { provider, model: this.getCurrentModel(), liveModel: this.liveModel, isOllama: this.useOllama,
+      configured: provider !== "unconfigured", revision: this.epoch, connectionStatus: this.status,
+      capabilities: { text: provider !== "unconfigured", image: gemini, audio: gemini, structured: gemini, live: gemini } }
+  }
+  getCurrentProvider(): LlmConfig["provider"] { return this.useOllama ? "ollama" : this.apiKey ? "gemini" : "unconfigured" }
+  getCurrentModel(): string { return this.useOllama ? this.ollamaModel : this.geminiModel }
+  isUsingOllama(): boolean { return this.useOllama }
+  async getGeminiClient(): Promise<GoogleGenAI> {
+    if (this.useOllama) throw new Error("This feature requires Gemini. Ollama currently supports text chat only.")
+    if (!this.apiKey) throw new Error("Configure a Gemini API key in Models to use this feature.")
+    return this.client ??= this.factory(this.apiKey).catch(error => { this.client = undefined; throw new Error(this.describeError(error)) })
+  }
+  describeError(error: unknown): string { return errorMessage(error, this.apiKey) }
+  cancelRequest(id: string): void { this.requests.get(id)?.abort() }
+  cancelAll(): void { for (const controller of this.requests.values()) controller.abort(); this.requests.clear(); this.epoch++ }
+  reset(): void { this.cancelAll(); this.history = []; this.context = []; this.images.clear() }
+  private async request<T>(run: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal, id: string = randomUUID()): Promise<T> {
+    if (this.requests.has(id)) throw new Error("Duplicate request ID")
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    signal?.addEventListener("abort", abort, { once: true })
+    if (signal?.aborted) controller.abort()
+    this.requests.set(id, controller)
+    try { controller.signal.throwIfAborted(); return await run(controller.signal) }
+    catch (error) { if (controller.signal.aborted) throw new DOMException("Request canceled", "AbortError"); throw new Error(this.describeError(error)) }
+    finally { signal?.removeEventListener("abort", abort); if (this.requests.get(id) === controller) this.requests.delete(id) }
+  }
+  private async retry<T>(run: () => Promise<T>, signal: AbortSignal, canRetry = () => true): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      signal.throwIfAborted()
+      try { return await run() }
+      catch (error) { if (attempt >= 2 || signal.aborted || !canRetry() || !isTransient(error)) throw error; await delay(500 * 2 ** attempt, undefined, { signal }) }
     }
   }
-
-  private async fileToGenerativePart(imagePath: string) {
-    const imageData = await fs.promises.readFile(imagePath)
-    return {
-      inlineData: {
-        data: imageData.toString("base64"),
-        mimeType: "image/png"
-      }
-    }
+  private current(epoch: number, signal?: AbortSignal): void {
+    signal?.throwIfAborted()
+    if (epoch !== this.epoch) throw new DOMException("Request canceled", "AbortError")
   }
-
-  private cleanJsonResponse(text: string): string {
-    // Remove markdown code block syntax if present
-    text = text.replace(/^```(?:json)?\n/, '').replace(/\n```$/, '');
-    // Remove any leading/trailing whitespace
-    text = text.trim();
-    return text;
+  private remember(text: string): void { this.context = [...this.context, text.slice(0, 12000)].slice(-3) }
+  private async generate(parts: Part[], schema?: unknown, external?: AbortSignal): Promise<string> {
+    const size = parts.reduce((bytes, part) => bytes + Buffer.byteLength(part.text || "") + (part.inlineData?.data?.length || 0), 0)
+    if (size > 18 * 1024 * 1024) throw new Error("Captured media is too large for one request. Use fewer or smaller images.")
+    return this.request(async signal => {
+      const client = await this.getGeminiClient()
+      signal.throwIfAborted()
+      const response = await this.retry(() => client.models.generateContent({ model: this.geminiModel, contents: [{ role: "user", parts }],
+        config: { systemInstruction: SYSTEM_PROMPT, abortSignal: signal, maxOutputTokens: 4096,
+          ...(schema ? { responseMimeType: "application/json", responseJsonSchema: schema } : {}) } }), signal)
+      signal.throwIfAborted()
+      if (!response.text?.trim()) throw new Error("The model returned no text. Try a different input.")
+      return response.text
+    }, external)
   }
-
-  private async callOllama(prompt: string): Promise<string> {
+  private async imagePart(file: string): Promise<Part> {
+    const data = await fs.readFile(file)
+    if (data.length > MAX_CLIP_BYTES) throw new Error("Images must be 10 MB or smaller")
+    if (!data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error("Use a PNG screenshot for image analysis")
+    return { inlineData: { data: data.toString("base64"), mimeType: "image/png" } }
+  }
+  async analyzeImageFile(file: string, signal?: AbortSignal): Promise<AnalysisResult> {
+    const epoch = this.epoch
+    await this.getGeminiClient()
+    this.current(epoch, signal)
+    const existing = this.images.get(file)
+    if (existing) { const result = await existing; this.current(epoch, signal); return result }
+    const request = (async () => {
+      const image = await this.imagePart(file)
+      this.current(epoch, signal)
+      const text = await this.generate([{ text: "Analyze this screenshot briefly and suggest useful responses or next steps." }, image], undefined, signal)
+      if (epoch !== this.epoch) throw new DOMException("Request canceled", "AbortError")
+      this.remember(text)
+      return { text, timestamp: Date.now() }
+    })()
+    this.images.set(file, request)
+    if (this.images.size > 5) this.images.delete(this.images.keys().next().value!)
+    try { return await request } catch (error) { if (this.images.get(file) === request) this.images.delete(file); throw error }
+  }
+  async analyzeAudioFromBase64(data: string, mime: string, signal?: AbortSignal): Promise<AnalysisResult> {
+    const epoch = this.epoch
+    await this.getGeminiClient()
+    this.current(epoch, signal)
+    validateClip(data)
+    const text = await this.generate([{ text: "Describe or transcribe this audio briefly and suggest useful responses or next steps." }, { inlineData: { data, mimeType: normalizeAudioMime(mime) } }], undefined, signal)
+    if (epoch !== this.epoch) throw new DOMException("Request canceled", "AbortError")
+    this.remember(text)
+    return { text, timestamp: Date.now() }
+  }
+  async analyzeAudioFile(file: string, signal?: AbortSignal): Promise<AnalysisResult> {
+    const epoch = this.epoch
+    await this.getGeminiClient()
+    this.current(epoch, signal)
+    if ((await fs.stat(file)).size > MAX_CLIP_BYTES) throw new Error("Audio clips must be 10 MB or smaller")
+    const bytes = await fs.readFile(file)
+    this.current(epoch, signal)
+    return this.analyzeAudioFromBase64(bytes.toString("base64"), audioMime(bytes, path.extname(file)), signal)
+  }
+  async extractProblemFromImages(files: string[], signal?: AbortSignal) {
+    const epoch = this.epoch
+    await this.getGeminiClient()
+    const images = await Promise.all(files.map(file => this.imagePart(file)))
+    this.current(epoch, signal)
+    const text = await this.generate([{ text: "Extract the problem or situation, context, suggested responses and brief rationale from these images." }, ...images], jsonSchema(extractedProblemSchema), signal)
+    return extractedProblemSchema.parse(JSON.parse(text))
+  }
+  async generateSolution(problem: unknown, signal?: AbortSignal): Promise<SolutionResult> {
+    const text = await this.generate([{ text: `Provide a solution to this situation: ${JSON.stringify(problem)}. Include practical thoughts and complexity fields; use N/A for complexity when the answer is not code.` }], jsonSchema(solutionSchema), signal)
+    return solutionSchema.parse(JSON.parse(text))
+  }
+  async debugSolutionWithImages(problem: unknown, code: string, files: string[], signal?: AbortSignal): Promise<SolutionResult> {
+    const epoch = this.epoch
+    await this.getGeminiClient()
+    const images = await Promise.all(files.map(file => this.imagePart(file)))
+    this.current(epoch, signal)
+    const text = await this.generate([{ text: `Improve the current answer using the new screenshots. Situation: ${JSON.stringify(problem)}. Current answer: ${code}. Use N/A for non-code complexity.` }, ...images], jsonSchema(solutionSchema), signal)
+    return solutionSchema.parse(JSON.parse(text))
+  }
+  async streamChat(id: string, message: string, onDelta: (text: string) => void): Promise<string> {
+    if (this.chatBusy) throw new Error("Wait for the current reply or cancel it first.")
+    if (!message.trim() || message.length > 20000) throw new Error("Messages must contain 1–20,000 characters")
+    this.chatBusy = true
+    const epoch = this.epoch
+    const turn: Content = { role: "user", parts: [{ text: message }] }
     try {
-      const response = await fetch(`${this.ollamaUrl}/api/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.ollamaModel,
-          prompt: prompt,
-          stream: false,
-          options: {
-            temperature: 0.7,
-            top_p: 0.9,
-          }
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`Ollama API error: ${response.status} ${response.statusText}`)
-      }
-
-      const data: OllamaResponse = await response.json()
-      return data.response
-    } catch (error) {
-      console.error("[LLMHelper] Error calling Ollama:", error)
-      throw new Error(`Failed to connect to Ollama: ${error.message}. Make sure Ollama is running on ${this.ollamaUrl}`)
-    }
-  }
-
-  private async checkOllamaAvailable(): Promise<boolean> {
-    try {
-      const response = await fetch(`${this.ollamaUrl}/api/tags`)
-      return response.ok
-    } catch {
-      return false
-    }
-  }
-
-  private async initializeOllamaModel(): Promise<void> {
-    try {
-      const availableModels = await this.getOllamaModels()
-      if (availableModels.length === 0) {
-        console.warn("[LLMHelper] No Ollama models found")
-        return
-      }
-
-      // Check if current model exists, if not use the first available
-      if (!availableModels.includes(this.ollamaModel)) {
-        this.ollamaModel = availableModels[0]
-        console.log(`[LLMHelper] Auto-selected first available model: ${this.ollamaModel}`)
-      }
-
-      // Test the selected model works
-      const testResult = await this.callOllama("Hello")
-      console.log(`[LLMHelper] Successfully initialized with model: ${this.ollamaModel}`)
-    } catch (error) {
-      console.error(`[LLMHelper] Failed to initialize Ollama model: ${error.message}`)
-      // Try to use first available model as fallback
-      try {
-        const models = await this.getOllamaModels()
-        if (models.length > 0) {
-          this.ollamaModel = models[0]
-          console.log(`[LLMHelper] Fallback to: ${this.ollamaModel}`)
-        }
-      } catch (fallbackError) {
-        console.error(`[LLMHelper] Fallback also failed: ${fallbackError.message}`)
-      }
-    }
-  }
-
-  public async extractProblemFromImages(imagePaths: string[]) {
-    try {
-      const imageParts = await Promise.all(imagePaths.map(path => this.fileToGenerativePart(path)))
-      
-      const prompt = `${this.systemPrompt}\n\nYou are a wingman. Please analyze these images and extract the following information in JSON format:\n{
-  "problem_statement": "A clear statement of the problem or situation depicted in the images.",
-  "context": "Relevant background or context from the images.",
-  "suggested_responses": ["First possible answer or action", "Second possible answer or action", "..."],
-  "reasoning": "Explanation of why these suggestions are appropriate."
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
-
-      const result = await this.model.generateContent([prompt, ...imageParts])
-      const response = await result.response
-      const text = this.cleanJsonResponse(response.text())
-      return JSON.parse(text)
-    } catch (error) {
-      console.error("Error extracting problem from images:", error)
-      throw error
-    }
-  }
-
-  public async generateSolution(problemInfo: any) {
-    const prompt = `${this.systemPrompt}\n\nGiven this problem or situation:\n${JSON.stringify(problemInfo, null, 2)}\n\nPlease provide your response in the following JSON format:\n{
-  "solution": {
-    "code": "The code or main answer here.",
-    "problem_statement": "Restate the problem or situation.",
-    "context": "Relevant background/context.",
-    "suggested_responses": ["First possible answer or action", "Second possible answer or action", "..."],
-    "reasoning": "Explanation of why these suggestions are appropriate."
-  }
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
-
-    console.log("[LLMHelper] Calling Gemini LLM for solution...");
-    try {
-      const result = await this.model.generateContent(prompt)
-      console.log("[LLMHelper] Gemini LLM returned result.");
-      const response = await result.response
-      const text = this.cleanJsonResponse(response.text())
-      const parsed = JSON.parse(text)
-      console.log("[LLMHelper] Parsed LLM response:", parsed)
-      return parsed
-    } catch (error) {
-      console.error("[LLMHelper] Error in generateSolution:", error);
-      throw error;
-    }
-  }
-
-  public async debugSolutionWithImages(problemInfo: any, currentCode: string, debugImagePaths: string[]) {
-    try {
-      const imageParts = await Promise.all(debugImagePaths.map(path => this.fileToGenerativePart(path)))
-      
-      const prompt = `${this.systemPrompt}\n\nYou are a wingman. Given:\n1. The original problem or situation: ${JSON.stringify(problemInfo, null, 2)}\n2. The current response or approach: ${currentCode}\n3. The debug information in the provided images\n\nPlease analyze the debug information and provide feedback in this JSON format:\n{
-  "solution": {
-    "code": "The code or main answer here.",
-    "problem_statement": "Restate the problem or situation.",
-    "context": "Relevant background/context.",
-    "suggested_responses": ["First possible answer or action", "Second possible answer or action", "..."],
-    "reasoning": "Explanation of why these suggestions are appropriate."
-  }
-}\nImportant: Return ONLY the JSON object, without any markdown formatting or code blocks.`
-
-      const result = await this.model.generateContent([prompt, ...imageParts])
-      const response = await result.response
-      const text = this.cleanJsonResponse(response.text())
-      const parsed = JSON.parse(text)
-      console.log("[LLMHelper] Parsed debug LLM response:", parsed)
-      return parsed
-    } catch (error) {
-      console.error("Error debugging solution with images:", error)
-      throw error
-    }
-  }
-
-  public async analyzeAudioFile(audioPath: string) {
-    try {
-      const audioData = await fs.promises.readFile(audioPath);
-      const audioPart = {
-        inlineData: {
-          data: audioData.toString("base64"),
-          mimeType: "audio/mp3"
-        }
-      };
-      const prompt = `${this.systemPrompt}\n\nDescribe this audio clip in a short, concise answer. In addition to your main answer, suggest several possible actions or responses the user could take next based on the audio. Do not return a structured JSON object, just answer naturally as you would to a user.`;
-      const result = await this.model.generateContent([prompt, audioPart]);
-      const response = await result.response;
-      const text = response.text();
-      return { text, timestamp: Date.now() };
-    } catch (error) {
-      console.error("Error analyzing audio file:", error);
-      throw error;
-    }
-  }
-
-  public async analyzeAudioFromBase64(data: string, mimeType: string) {
-    try {
-      const audioPart = {
-        inlineData: {
-          data,
-          mimeType
-        }
-      };
-      const prompt = `${this.systemPrompt}\n\nDescribe this audio clip in a short, concise answer. In addition to your main answer, suggest several possible actions or responses the user could take next based on the audio. Do not return a structured JSON object, just answer naturally as you would to a user and be concise.`;
-      const result = await this.model.generateContent([prompt, audioPart]);
-      const response = await result.response;
-      const text = response.text();
-      return { text, timestamp: Date.now() };
-    } catch (error) {
-      console.error("Error analyzing audio from base64:", error);
-      throw error;
-    }
-  }
-
-  public async analyzeImageFile(imagePath: string) {
-    try {
-      const imageData = await fs.promises.readFile(imagePath);
-      const imagePart = {
-        inlineData: {
-          data: imageData.toString("base64"),
-          mimeType: "image/png"
-        }
-      };
-      const prompt = `${this.systemPrompt}\n\nDescribe the content of this image in a short, concise answer. In addition to your main answer, suggest several possible actions or responses the user could take next based on the image. Do not return a structured JSON object, just answer naturally as you would to a user. Be concise and brief.`;
-      const result = await this.model.generateContent([prompt, imagePart]);
-      const response = await result.response;
-      const text = response.text();
-      return { text, timestamp: Date.now() };
-    } catch (error) {
-      console.error("Error analyzing image file:", error);
-      throw error;
-    }
-  }
-
-  public async chatWithGemini(message: string): Promise<string> {
-    try {
-      if (this.useOllama) {
-        return this.callOllama(message);
-      } else if (this.model) {
-        const result = await this.model.generateContent(message);
-        const response = await result.response;
-        return response.text();
-      } else {
-        throw new Error("No LLM provider configured");
-      }
-    } catch (error) {
-      console.error("[LLMHelper] Error in chatWithGemini:", error);
-      throw error;
-    }
-  }
-
-  public async chat(message: string): Promise<string> {
-    return this.chatWithGemini(message);
-  }
-
-  public isUsingOllama(): boolean {
-    return this.useOllama;
-  }
-
-  public async getOllamaModels(): Promise<string[]> {
-    if (!this.useOllama) return [];
-    
-    try {
-      const response = await fetch(`${this.ollamaUrl}/api/tags`);
-      if (!response.ok) throw new Error('Failed to fetch models');
-      
-      const data = await response.json();
-      return data.models?.map((model: any) => model.name) || [];
-    } catch (error) {
-      console.error("[LLMHelper] Error fetching Ollama models:", error);
-      return [];
-    }
-  }
-
-  public getCurrentProvider(): "ollama" | "gemini" {
-    return this.useOllama ? "ollama" : "gemini";
-  }
-
-  public getCurrentModel(): string {
-    return this.useOllama ? this.ollamaModel : "gemini-2.0-flash";
-  }
-
-  public async switchToOllama(model?: string, url?: string): Promise<void> {
-    this.useOllama = true;
-    if (url) this.ollamaUrl = url;
-    
-    if (model) {
-      this.ollamaModel = model;
-    } else {
-      // Auto-detect first available model
-      await this.initializeOllamaModel();
-    }
-    
-    console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel} at ${this.ollamaUrl}`);
-  }
-
-  public async switchToGemini(apiKey?: string): Promise<void> {
-    if (apiKey) {
-      const genAI = new GoogleGenerativeAI(apiKey);
-      this.model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    }
-    
-    if (!this.model && !apiKey) {
-      throw new Error("No Gemini API key provided and no existing model instance");
-    }
-    
-    this.useOllama = false;
-    console.log("[LLMHelper] Switched to Gemini");
-  }
-
-  public async testConnection(): Promise<{ success: boolean; error?: string }> {
-    try {
-      if (this.useOllama) {
-        const available = await this.checkOllamaAvailable();
-        if (!available) {
-          return { success: false, error: `Ollama not available at ${this.ollamaUrl}` };
-        }
-        // Test with a simple prompt
-        await this.callOllama("Hello");
-        return { success: true };
-      } else {
-        if (!this.model) {
-          return { success: false, error: "No Gemini model configured" };
-        }
-        // Test with a simple prompt
-        const result = await this.model.generateContent("Hello");
-        const response = await result.response;
-        const text = response.text(); // Ensure the response is valid
-        if (text) {
-          return { success: true };
+      return await this.request(async signal => {
+        let text = ""
+        if (this.useOllama) {
+          const response = await fetch(`${this.ollamaUrl}/api/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, signal,
+            body: JSON.stringify({ model: this.ollamaModel, stream: false, messages: [{ role: "system", content: SYSTEM_PROMPT },
+              ...this.history.map(item => ({ role: item.role === "model" ? "assistant" : "user", content: item.parts?.map(part => part.text || "").join("") })), { role: "user", content: message }] }) })
+          if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}. Check the server and model.`)
+          const result = await response.json() as { message?: { content?: string } }
+          text = result.message?.content || ""
+          signal.throwIfAborted()
+          onDelta(text)
         } else {
-          return { success: false, error: "Empty response from Gemini" };
+          const client = await this.getGeminiClient()
+          await this.retry(async () => {
+            const stream = await client.models.generateContentStream({ model: this.geminiModel, contents: [...this.history, turn],
+              config: { systemInstruction: SYSTEM_PROMPT + (this.context.length ? `\nRecent captured context:\n${this.context.join("\n")}` : ""), abortSignal: signal, maxOutputTokens: 4096 } })
+            for await (const chunk of stream) { signal.throwIfAborted(); if (chunk.text) { text += chunk.text; onDelta(chunk.text) } }
+          }, signal, () => !text)
         }
-      }
-    } catch (error) {
-      return { success: false, error: error.message };
-    }
+        signal.throwIfAborted()
+        if (!text.trim()) throw new Error("The model returned no text")
+        if (epoch !== this.epoch) throw new DOMException("Request canceled", "AbortError")
+        this.history = [...this.history, turn, { role: "model", parts: [{ text }] }].slice(-40)
+        return text
+      }, undefined, id)
+    } finally { this.chatBusy = false }
   }
-} 
+  async chatWithGemini(message: string): Promise<string> { return this.streamChat(randomUUID(), message, () => {}) }
+  async chat(message: string): Promise<string> { return this.chatWithGemini(message) }
+  async getOllamaModels(): Promise<string[]> {
+    try {
+      const response = await fetch(`${this.ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(5000) })
+      if (!response.ok) return []
+      const data = await response.json() as { models?: { name: string }[] }
+      return data.models?.map(model => model.name) || []
+    } catch { return [] }
+  }
+  async switchToOllama(model?: string, url?: string): Promise<void> {
+    this.reset()
+    if (url) { const parsed = new URL(url); if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Use an HTTP or HTTPS Ollama URL"); this.ollamaUrl = url.replace(/\/$/, "") }
+    if (model) this.ollamaModel = model
+    else this.ollamaModel = (await this.getOllamaModels())[0] || this.ollamaModel
+    this.useOllama = true
+    this.status = "configured"
+  }
+  async switchToGemini(apiKey?: string): Promise<void> {
+    const nextKey = apiKey?.trim() || this.apiKey
+    if (!nextKey) throw new Error("Enter a Gemini API key")
+    this.reset()
+    if (nextKey !== this.apiKey) { this.apiKey = nextKey; this.client = undefined }
+    this.useOllama = false
+    this.status = "configured"
+  }
+  async testConnection(): Promise<{ success: boolean; error?: string }> {
+    this.status = "testing"
+    try {
+      if (this.useOllama) {
+        const response = await fetch(`${this.ollamaUrl}/api/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(15000), body: JSON.stringify({ model: this.ollamaModel, stream: false, messages: [{ role: "user", content: "Reply OK." }] }) })
+        if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`)
+      } else await this.generate([{ text: "Reply OK." }])
+      this.status = "connected"
+      return { success: true }
+    } catch (error) { this.status = "error"; return { success: false, error: this.describeError(error) } }
+  }
+}

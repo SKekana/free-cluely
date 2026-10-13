@@ -38,6 +38,8 @@ npm install
    **For Gemini (Cloud AI):**
    ```env
    GEMINI_API_KEY=your_api_key_here
+   GEMINI_MODEL=gemini-3.5-flash-lite
+   GEMINI_LIVE_MODEL=gemini-3.8-live
    ```
    
    **For Ollama (Local/Private AI):**
@@ -230,7 +232,8 @@ If you see other errors:
 ## Technical Details
 
 ### **AI Models Supported**
-- **Gemini 2.0 Flash** - Latest Google AI with vision capabilities
+- **Gemini 3.5 Flash-Lite** - Chat, screenshot and recorded-audio analysis
+- **Gemini 3.8 Live** - Silent live captions and continuous assistance with microphone, system audio and screen input
 - **Llama 3.2** - Meta's advanced local model via Ollama
 - **CodeLlama** - Specialized coding assistance
 - **Mistral** - Lightweight, fast responses
@@ -266,3 +269,13 @@ ISC License - Free for personal and commercial use.
 
 ### 🏷️ Tags
 `ai-assistant` `meeting-notes` `interview-helper` `presentation-support` `ollama` `gemini-ai` `electron-app` `cross-platform` `privacy-focused` `open-source` `local-ai` `screenshot-analysis` `academic-helper` `sales-assistant` `coding-companion`
+
+## Gemini Live setup
+
+The app defaults to `gemini-3.5-flash-lite` for regular requests and `gemini-3.8-live` for Live. Add your key to `.env` or enter it in Models for the current session. Models displays configuration separately from a successful connection test.
+
+In **Capture settings**, choose a microphone, system output, and screen/window, then select **Start Live**. Assistance is text-only; **Show captions** expands the input transcript. Capture continues across page changes and while the overlay is hidden. **Stop Live**, reset, switching providers, and quitting release the capture devices. **Record Clip** is a separate action limited to two minutes or 10 MB.
+
+Linux system audio needs PulseAudio or PipeWire's PulseAudio compatibility server plus `pulseaudio-utils` (`pactl` and `parec`). Windows uses Electron audio loopback. Missing inputs are shown in capture settings; disable an input to deliberately omit it. System-audio capture on macOS is deferred. Ollama supports text chat; Gemini is required for the other AI features.
+
+Run `npm run typecheck`, `npm test`, and `npm run build` for local verification. `npm run test:gemini` runs opt-in authenticated checks using the configured key and requires `ffmpeg` for audio fixture conversion. See [the implementation report](docs/gemini-research.md) for architecture, test details, and desktop acceptance checks.

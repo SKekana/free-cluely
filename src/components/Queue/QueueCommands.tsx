@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react"
 import { IoLogOutOutline } from "react-icons/io5"
-import { Dialog, DialogContent, DialogClose } from "../ui/dialog"
+import { useCapture } from "../../capture/CaptureContext"
 
 interface QueueCommandsProps {
   onTooltipVisibilityChange: (visible: boolean, height: number) => void
@@ -17,11 +17,9 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
 }) => {
   const [isTooltipVisible, setIsTooltipVisible] = useState(false)
   const tooltipRef = useRef<HTMLDivElement>(null)
-  const [isRecording, setIsRecording] = useState(false)
-  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null)
-  const [audioResult, setAudioResult] = useState<string | null>(null)
-  const chunks = useRef<Blob[]>([])
-  // Remove all chat-related state, handlers, and the Dialog overlay from this file.
+  const capture = useCapture()
+  const isRecording = capture.clipRecording
+  const audioResult = capture.clipResult
 
   useEffect(() => {
     let tooltipHeight = 0
@@ -39,47 +37,11 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
     setIsTooltipVisible(false)
   }
 
-  const handleRecordClick = async () => {
-    if (!isRecording) {
-      // Start recording
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-        const recorder = new MediaRecorder(stream)
-        recorder.ondataavailable = (e) => chunks.current.push(e.data)
-        recorder.onstop = async () => {
-          const blob = new Blob(chunks.current, { type: chunks.current[0]?.type || 'audio/webm' })
-          chunks.current = []
-          const reader = new FileReader()
-          reader.onloadend = async () => {
-            const base64Data = (reader.result as string).split(',')[1]
-            try {
-              const result = await window.electronAPI.analyzeAudioFromBase64(base64Data, blob.type)
-              setAudioResult(result.text)
-            } catch (err) {
-              setAudioResult('Audio analysis failed.')
-            }
-          }
-          reader.readAsDataURL(blob)
-        }
-        setMediaRecorder(recorder)
-        recorder.start()
-        setIsRecording(true)
-      } catch (err) {
-        setAudioResult('Could not start recording.')
-      }
-    } else {
-      // Stop recording
-      mediaRecorder?.stop()
-      setIsRecording(false)
-      setMediaRecorder(null)
-    }
-  }
-
-  // Remove handleChatSend function
+  const handleRecordClick = () => isRecording ? capture.stopClip() : void capture.startClip()
 
   return (
     <div className="w-fit">
-      <div className="text-xs text-white/90 liquid-glass-bar py-1 px-4 flex items-center justify-center gap-4 draggable-area">
+      <div className="toolbar-controls text-xs liquid-glass-bar py-1 px-4 flex items-center justify-center gap-4 draggable-area">
         {/* Show/Hide */}
         <div className="flex items-center gap-2">
           <span className="text-[11px] leading-none">Show/Hide</span>
@@ -115,13 +77,16 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
         <div className="flex items-center gap-2">
           <button
             className={`bg-white/10 hover:bg-white/20 transition-colors rounded-md px-2 py-1 text-[11px] leading-none text-white/70 flex items-center gap-1 ${isRecording ? 'bg-red-500/70 hover:bg-red-500/90' : ''}`}
+            disabled={capture.liveBusy || capture.clipBusy || !capture.config?.capabilities.audio}
+            title={capture.liveBusy ? "Stop Live before recording a clip" : "Record a clip of up to two minutes"}
+            data-recording={isRecording}
             onClick={handleRecordClick}
             type="button"
           >
             {isRecording ? (
               <span className="animate-pulse">● Stop Recording</span>
             ) : (
-              <span>🎤 Record Voice</span>
+              <span>{capture.clipBusy ? "Processing clip…" : "🎤 Record Clip"}</span>
             )}
           </button>
         </div>

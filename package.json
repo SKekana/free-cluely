@@ -5,7 +5,7 @@
   "scripts": {
     "clean": "rimraf dist dist-electron",
     "dev": "vite",
-    "build": "npm run clean && tsc && vite build",
+    "build": "npm run clean && tsc && tsc -p electron/tsconfig.json && vite build",
     "preview": "vite preview",
     "postinstall": "cross-env SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm rebuild sharp",
     "electron:dev": "tsc -p electron/tsconfig.json && cross-env NODE_ENV=development electron .",
@@ -14,7 +14,11 @@
     "app:build": "npm run build && electron-builder",
     "watch": "tsc -p electron/tsconfig.json --watch",
     "start": "npm run app:dev",
-    "dist": "npm run app:build"
+    "dist": "npm run app:build",
+    "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gemini": "vitest run --config vitest.smoke.config.ts"
   },
   "build": {
     "appId": "com.electron.meeting-notes",
@@ -23,18 +27,16 @@
       "dist/**/*",
       "dist-electron/**/*",
       "package.json",
-      "node_modules/**/*"
+      "node_modules/**/*",
+      "!.env",
+      "!.env.*",
+      "!node_modules/.cache/**/*"
     ],
     "directories": {
       "output": "release",
       "buildResources": "assets"
     },
-    "extraResources": [
-      {
-        "from": "assets/",
-        "to": "assets/"
-      }
-    ],
+    "extraResources": [],
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
@@ -66,7 +68,6 @@
           ]
         }
       ],
-      "icon": "assets/icons/win/icon.ico",
       "requestedExecutionLevel": "asInvoker"
     },
     "linux": {
@@ -84,7 +85,6 @@
           ]
         }
       ],
-      "icon": "assets/icons/png/",
       "category": "Office"
     },
     "nsis": {
@@ -131,11 +131,11 @@
     "vite": "^5.4.11",
     "vite-plugin-electron": "^0.28.8",
     "vite-plugin-electron-renderer": "^0.14.6",
-    "wait-on": "^8.0.1"
+    "wait-on": "^8.0.1",
+    "vitest": "3.2.7"
   },
   "dependencies": {
-    "@google/genai": "^0.12.0",
-    "@google/generative-ai": "^0.2.1",
+    "@google/genai": "2.29.1",
     "@radix-ui/react-dialog": "^1.1.2",
     "@radix-ui/react-toast": "^1.2.2",
     "axios": "^1.7.7",
@@ -154,6 +154,8 @@
     "sharp": "^0.33.5",
     "tailwind-merge": "^2.5.4",
     "tesseract.js": "^5.0.5",
-    "uuid": "^11.0.3"
+    "uuid": "^11.0.3",
+    "dotenv": "^16.6.1",
+    "zod": "^4.1.12"
   }
 }

@@ -1,9 +1,36 @@
 // ipcHandlers.ts
 
 import { ipcMain, app } from "electron"
-import { AppState } from "./main"
+import type { AppState } from "./main"
+import type { AudioPacket, FramePacket, LiveOptions } from "./contracts"
+import { z } from "zod"
 
 export function initializeIpcHandlers(appState: AppState): void {
+  const llm = appState.processingHelper.getLLMHelper()
+  const broadcastConfig = () => appState.getMainWindow()?.webContents.send("llm-config", llm.getConfig())
+  ipcMain.handle("chat-start", (event, requestId: string, message: string) => {
+    if (typeof requestId !== "string" || !/^[\w-]{1,100}$/.test(requestId) || typeof message !== "string") return { success: false, error: "Invalid chat request" }
+    void llm.streamChat(requestId, message, text => {
+      if (!event.sender.isDestroyed()) event.sender.send("chat-event", { requestId, type: "delta", text })
+    }).then(text => {
+      if (!event.sender.isDestroyed()) event.sender.send("chat-event", { requestId, type: "done", text })
+    }).catch(error => {
+      if (!event.sender.isDestroyed()) event.sender.send("chat-event", { requestId, type: error.name === "AbortError" ? "canceled" : "error", error: llm.describeError(error) })
+    })
+    return { success: true }
+  })
+  ipcMain.handle("chat-cancel", (_, id: string) => llm.cancelRequest(id))
+  ipcMain.handle("capture-capabilities", () => appState.captureHelper.capabilities())
+  ipcMain.handle("capture-sources", () => appState.captureHelper.list())
+  ipcMain.handle("capture-select", (_, id: string, audio: boolean) => appState.captureHelper.select(id, audio))
+  ipcMain.handle("capture-mask", (_, id: string) => appState.captureHelper.mask(id))
+  const liveOptions = z.object({ microphone: z.boolean(), systemAudio: z.boolean(), screen: z.boolean(), sourceId: z.string().optional(), systemSourceId: z.string().optional() })
+  ipcMain.handle("live-start", (_, options: LiveOptions) => appState.startLive(liveOptions.parse(options)))
+  ipcMain.handle("live-stop", () => appState.stopLive())
+  ipcMain.handle("live-test", () => appState.liveHelper.testConnection())
+  ipcMain.handle("live-audio-pause", (_, id: string) => { if (id === appState.liveHelper.sessionId) appState.liveHelper.pauseAudio() })
+  ipcMain.on("live-audio", (_, packet: AudioPacket) => { if (packet && typeof packet === "object") appState.receiveAudio(packet) })
+  ipcMain.on("live-frame", (_, packet: FramePacket) => { if (packet && typeof packet === "object") appState.receiveFrame(packet) })
   ipcMain.handle(
     "update-content-dimensions",
     async (event, { width, height }: { width: number; height: number }) => {
@@ -103,16 +130,6 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   })
 
-  ipcMain.handle("gemini-chat", async (event, message: string) => {
-    try {
-      const result = await appState.processingHelper.getLLMHelper().chatWithGemini(message);
-      return result;
-    } catch (error: any) {
-      console.error("Error in gemini-chat handler:", error);
-      throw error;
-    }
-  });
-
   ipcMain.handle("quit-app", () => {
     app.quit()
   })
@@ -139,19 +156,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   })
 
   // LLM Model Management Handlers
-  ipcMain.handle("get-current-llm-config", async () => {
-    try {
-      const llmHelper = appState.processingHelper.getLLMHelper();
-      return {
-        provider: llmHelper.getCurrentProvider(),
-        model: llmHelper.getCurrentModel(),
-        isOllama: llmHelper.isUsingOllama()
-      };
-    } catch (error: any) {
-      console.error("Error getting current LLM config:", error);
-      throw error;
-    }
-  });
+  ipcMain.handle("get-current-llm-config", () => llm.getConfig())
 
   ipcMain.handle("get-available-ollama-models", async () => {
     try {
@@ -167,10 +172,13 @@ export function initializeIpcHandlers(appState: AppState): void {
   ipcMain.handle("switch-to-ollama", async (_, model?: string, url?: string) => {
     try {
       const llmHelper = appState.processingHelper.getLLMHelper();
+      appState.stopLive();
+      appState.processingHelper.cancelOngoingRequests();
       await llmHelper.switchToOllama(model, url);
+      broadcastConfig();
       return { success: true };
     } catch (error: any) {
-      console.error("Error switching to Ollama:", error);
+      broadcastConfig();
       return { success: false, error: error.message };
     }
   });
@@ -178,10 +186,13 @@ export function initializeIpcHandlers(appState: AppState): void {
   ipcMain.handle("switch-to-gemini", async (_, apiKey?: string) => {
     try {
       const llmHelper = appState.processingHelper.getLLMHelper();
+      appState.stopLive();
+      appState.processingHelper.cancelOngoingRequests();
       await llmHelper.switchToGemini(apiKey);
+      broadcastConfig();
       return { success: true };
     } catch (error: any) {
-      console.error("Error switching to Gemini:", error);
+      broadcastConfig();
       return { success: false, error: error.message };
     }
   });
@@ -189,7 +200,10 @@ export function initializeIpcHandlers(appState: AppState): void {
   ipcMain.handle("test-llm-connection", async () => {
     try {
       const llmHelper = appState.processingHelper.getLLMHelper();
-      const result = await llmHelper.testConnection();
+      const pending = llmHelper.testConnection();
+      broadcastConfig();
+      const result = await pending;
+      broadcastConfig();
       return result;
     } catch (error: any) {
       console.error("Error testing LLM connection:", error);

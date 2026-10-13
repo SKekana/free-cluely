@@ -14,22 +14,24 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies
         run: |
-          npm install
+          npm ci
         env:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
+
+      - name: Check types and unit tests
+        run: |
+          npm run typecheck
+          npm test
 
       - name: Build application
         run: npm run build
         env:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
-
-      - name: Compile Electron TypeScript
-        run: npx tsc -p electron/tsconfig.json
 
       - name: Package with Electron Builder
         run: npx electron-builder --publish=never

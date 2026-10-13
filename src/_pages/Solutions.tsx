@@ -132,7 +132,6 @@ const Solutions: React.FC<SolutionsProps> = ({ setView }) => {
   const contentRef = useRef<HTMLDivElement>(null)
 
   // Audio recording state
-  const [audioRecording, setAudioRecording] = useState(false)
   const [audioResult, setAudioResult] = useState<AudioResult | null>(null)
 
   const [debugProcessing, setDebugProcessing] = useState(false)
@@ -255,47 +254,6 @@ const Solutions: React.FC<SolutionsProps> = ({ setView }) => {
         setCustomContent(null)
         setAudioResult(null)
 
-        // Start audio recording from user's microphone
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          const mediaRecorder = new MediaRecorder(stream)
-          const chunks: Blob[] = []
-          mediaRecorder.ondataavailable = (e) => chunks.push(e.data)
-          mediaRecorder.start()
-          setAudioRecording(true)
-          // Record for 5 seconds (or adjust as needed)
-          setTimeout(() => mediaRecorder.stop(), 5000)
-          mediaRecorder.onstop = async () => {
-            setAudioRecording(false)
-            const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' })
-            const reader = new FileReader()
-            reader.onloadend = async () => {
-              const base64Data = (reader.result as string).split(',')[1]
-              // Send audio to Gemini for analysis
-              try {
-                const result = await window.electronAPI.analyzeAudioFromBase64(
-                  base64Data,
-                  blob.type
-                )
-                // Store result in react-query cache
-                queryClient.setQueryData(["audio_result"], result)
-                setAudioResult(result)
-              } catch (err) {
-                console.error('Audio analysis failed:', err)
-              }
-            }
-            reader.readAsDataURL(blob)
-          }
-        } catch (err) {
-          console.error('Audio recording error:', err)
-        }
-
-        // Simulate receiving custom content shortly after start
-        setTimeout(() => {
-          setCustomContent(
-            "This is the dynamically generated content appearing after loading starts."
-          )
-        }, 1500) // Example delay
       }),
       //if there was an error processing the initial solution
       window.electronAPI.onSolutionError((error: string) => {

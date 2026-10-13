@@ -10,6 +10,7 @@ import {
 } from "../components/ui/toast"
 import QueueCommands from "../components/Queue/QueueCommands"
 import ModelSelector from "../components/ui/ModelSelector"
+import { DEFAULT_GEMINI_MODEL } from "../../electron/contracts"
 
 interface QueueProps {
   setView: React.Dispatch<React.SetStateAction<"queue" | "solutions" | "debug">>
@@ -28,13 +29,16 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
   const contentRef = useRef<HTMLDivElement>(null)
 
   const [chatInput, setChatInput] = useState("")
-  const [chatMessages, setChatMessages] = useState<{role: "user"|"gemini", text: string}[]>([])
+  const [chatMessages, setChatMessages] = useState<{role: "user"|"gemini", text: string, id?: string}[]>([])
   const [chatLoading, setChatLoading] = useState(false)
+  const [imageLoading, setImageLoading] = useState(false)
+  const activeChat = useRef<string | null>(null)
+  const imageEpoch = useRef(0)
   const [isChatOpen, setIsChatOpen] = useState(false)
   const chatInputRef = useRef<HTMLInputElement>(null)
   
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  const [currentModel, setCurrentModel] = useState<{ provider: string; model: string }>({ provider: "gemini", model: "gemini-3-pro-preview" })
+  const [currentModel, setCurrentModel] = useState<{ provider: string; model: string }>({ provider: "gemini", model: DEFAULT_GEMINI_MODEL })
 
   const barRef = useRef<HTMLDivElement>(null)
 
@@ -87,33 +91,37 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
   }
 
   const handleChatSend = async () => {
-    if (!chatInput.trim()) return
-    setChatMessages((msgs) => [...msgs, { role: "user", text: chatInput }])
-    setChatLoading(true)
-    setChatInput("")
+    if (!chatInput.trim() || activeChat.current) return
+    const id = crypto.randomUUID(), message = chatInput
+    activeChat.current = id
+    setChatMessages(msgs => [...msgs, { role: "user", text: message }, { role: "gemini", text: "", id }])
+    setChatLoading(true); setChatInput("")
     try {
-      const response = await window.electronAPI.invoke("gemini-chat", chatInput)
-      setChatMessages((msgs) => [...msgs, { role: "gemini", text: response }])
-    } catch (err) {
-      setChatMessages((msgs) => [...msgs, { role: "gemini", text: "Error: " + String(err) }])
-    } finally {
-      setChatLoading(false)
-      chatInputRef.current?.focus()
+      const result = await window.electronAPI.startChat(id, message)
+      if (!result.success) throw new Error(result.error)
+    } catch (error) {
+      if (activeChat.current !== id) return
+      setChatMessages(msgs => msgs.map(msg => msg.id === id ? { ...msg, text: String(error) } : msg))
+      activeChat.current = null; setChatLoading(false)
     }
   }
-
-  // Load current model configuration on mount
   useEffect(() => {
-    const loadCurrentModel = async () => {
-      try {
-        const config = await window.electronAPI.getCurrentLlmConfig();
-        setCurrentModel({ provider: config.provider, model: config.model });
-      } catch (error) {
-        console.error('Error loading current model config:', error);
-      }
-    };
-    loadCurrentModel();
-  }, []);
+    const reset = () => { activeChat.current = null; imageEpoch.current++; setChatLoading(false); setImageLoading(false); setChatMessages([]) }
+    let previous = ""
+    const onConfig = (config: { provider: string; model: string; configured: boolean; revision: number }) => {
+      const signature = config.provider + config.model + config.revision
+      if (previous && previous !== signature) reset()
+      previous = signature; setCurrentModel({ provider: config.provider, model: config.model })
+      if (!config.configured) setIsSettingsOpen(true)
+    }
+    void window.electronAPI.getCurrentLlmConfig().then(onConfig)
+    const subscriptions = [window.electronAPI.onResetView(reset), window.electronAPI.onLlmConfig(onConfig), window.electronAPI.onChatEvent(event => {
+      if (event.requestId !== activeChat.current) return
+      setChatMessages(msgs => msgs.map(msg => msg.id === event.requestId ? { ...msg, text: event.type === "delta" ? msg.text + (event.text || "") : event.type === "done" ? event.text || msg.text : event.type === "canceled" ? msg.text || "Canceled" : event.error || "Chat failed" } : msg))
+      if (event.type !== "delta") { activeChat.current = null; setChatLoading(false); chatInputRef.current?.focus() }
+    })]
+    return () => { subscriptions.forEach(unsubscribe => unsubscribe()); imageEpoch.current++; if (activeChat.current) void window.electronAPI.cancelChat(activeChat.current); activeChat.current = null }
+  }, [])
 
   useEffect(() => {
     const updateDimensions = () => {
@@ -163,32 +171,21 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
     }
   }, [isTooltipVisible, tooltipHeight])
 
-  // Seamless screenshot-to-LLM flow
   useEffect(() => {
-    // Listen for screenshot taken event
-    const unsubscribe = window.electronAPI.onScreenshotTaken(async (data) => {
-      // Refetch screenshots to update the queue
-      await refetch();
-      // Show loading in chat
-      setChatLoading(true);
+    const unsubscribe = window.electronAPI.onScreenshotTaken(async data => {
+      const epoch = ++imageEpoch.current
+      setImageLoading(true); await refetch()
       try {
-        // Get the latest screenshot path
-        const latest = data?.path || (Array.isArray(data) && data.length > 0 && data[data.length - 1]?.path);
-        if (latest) {
-          // Call the LLM to process the screenshot
-          const response = await window.electronAPI.invoke("analyze-image-file", latest);
-          setChatMessages((msgs) => [...msgs, { role: "gemini", text: response.text }]);
-        }
-      } catch (err) {
-        setChatMessages((msgs) => [...msgs, { role: "gemini", text: "Error: " + String(err) }]);
-      } finally {
-        setChatLoading(false);
-      }
-    });
-    return () => {
-      unsubscribe && unsubscribe();
-    };
-  }, [refetch]);
+        const config = await window.electronAPI.getCurrentLlmConfig()
+        if (!config.capabilities.image) throw new Error("Screenshot analysis requires Gemini")
+        const response = await window.electronAPI.analyzeImageFile(data.path)
+        if (epoch === imageEpoch.current) setChatMessages(msgs => [...msgs, { role: "gemini", text: response.text }])
+      } catch (error) {
+        if (epoch === imageEpoch.current) setChatMessages(msgs => [...msgs, { role: "gemini", text: String(error) }])
+      } finally { if (epoch === imageEpoch.current) setImageLoading(false) }
+    })
+    return () => { unsubscribe(); imageEpoch.current++ }
+  }, [refetch])
 
   const handleTooltipVisibilityChange = (visible: boolean, height: number) => {
     setIsTooltipVisible(visible)
@@ -206,7 +203,7 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
   const handleModelChange = (provider: "ollama" | "gemini", model: string) => {
     setCurrentModel({ provider, model })
     // Update chat messages to reflect the model change
-    const modelName = provider === "ollama" ? model : "Gemini 3 Pro"
+    const modelName = model
     setChatMessages((msgs) => [...msgs, { 
       role: "gemini", 
       text: `🔄 Switched to ${provider === "ollama" ? "🏠" : "☁️"} ${modelName}. Ready for your questions!` 
@@ -281,7 +278,7 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
                   </div>
                 ))
               )}
-              {chatLoading && (
+              {(chatLoading || imageLoading) && (
                 <div className="flex justify-start mb-3">
                   <div className="bg-white/85 text-gray-600 px-3 py-1.5 rounded-xl text-xs backdrop-blur-sm border border-gray-200/50 shadow-md mr-12">
                     <span className="inline-flex items-center">
@@ -307,12 +304,12 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
                 placeholder="Type your message..."
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
-                disabled={chatLoading}
+                disabled={chatLoading || imageLoading}
               />
               <button
                 type="submit"
                 className="p-2 rounded-lg bg-gray-600/80 hover:bg-gray-700/80 border border-gray-500/60 flex items-center justify-center transition-all duration-200 backdrop-blur-sm shadow-lg disabled:opacity-50"
-                disabled={chatLoading || !chatInput.trim()}
+                disabled={chatLoading || imageLoading || !chatInput.trim()}
                 tabIndex={-1}
                 aria-label="Send"
               >
@@ -320,6 +317,7 @@ const Queue: React.FC<QueueProps> = ({ setView }) => {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 19.5l15-7.5-15-7.5v6l10 1.5-10 1.5v6z" />
                 </svg>
               </button>
+              {chatLoading && <button type="button" className="px-2 text-xs text-gray-600" onClick={() => { if (activeChat.current) void window.electronAPI.cancelChat(activeChat.current) }}>Cancel</button>}
             </form>
           </div>
           )}

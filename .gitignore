@@ -136,3 +136,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Local web research cache
+.firecrawl/
+
+# Packaged application artifacts
+release/

@@ -165,3 +165,10 @@ button, input, select, textarea, .interactive {
   animation: shimmer 3s ease-in-out infinite;
   pointer-events: none;
 }
+
+/* Toolbar labels remain readable on the existing light glass surface. */
+.toolbar-controls { color: #1f2937; }
+.toolbar-controls > div > button,
+.toolbar-controls > div > div > button { color: #374151; }
+.toolbar-controls button[data-recording="true"] { color: white; }
+.toolbar-controls button:disabled { opacity: .5; cursor: not-allowed; }

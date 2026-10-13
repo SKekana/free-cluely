@@ -1,6 +1,6 @@
 
 import { BrowserWindow, screen } from "electron"
-import { AppState } from "main"
+import type { AppState } from "./main"
 import path from "node:path"
 
 const isDev = process.env.NODE_ENV === "development"
@@ -79,7 +79,8 @@ export class WindowHelper {
       minWidth: 300,
       minHeight: 200,
       webPreferences: {
-        nodeIntegration: true,
+        nodeIntegration: false,
+        backgroundThrottling: false,
         contextIsolation: true,
         preload: path.join(__dirname, "preload.js")
       },

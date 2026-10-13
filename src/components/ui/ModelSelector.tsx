@@ -1,10 +1,6 @@
 import React, { useState, useEffect } from 'react';
 
-interface ModelConfig {
-  provider: "ollama" | "gemini";
-  model: string;
-  isOllama: boolean;
-}
+import type { LlmConfig as ModelConfig } from "../../../electron/contracts"
 
 interface ModelSelectorProps {
   onModelChange?: (provider: "ollama" | "gemini", model: string) => void;
@@ -31,7 +27,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
       setIsLoading(true);
       const config = await window.electronAPI.getCurrentLlmConfig();
       setCurrentConfig(config);
-      setSelectedProvider(config.provider);
+      setSelectedProvider(config.provider === "ollama" ? "ollama" : "gemini");
       
       if (config.isOllama) {
         setSelectedOllamaModel(config.model);
@@ -86,8 +82,10 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
 
       if (result.success) {
         await loadCurrentConfig();
-        setConnectionStatus('success');
-        onModelChange?.(selectedProvider, selectedProvider === 'ollama' ? selectedOllamaModel : 'gemini-2.0-flash');
+        const config = await window.electronAPI.getCurrentLlmConfig();
+        setConnectionStatus(null);
+        setGeminiApiKey('');
+        onModelChange?.(config.provider === 'ollama' ? 'ollama' : 'gemini', config.model);
         // Auto-open chat window after successful model change
         setTimeout(() => {
           onChatOpen?.();
@@ -116,7 +114,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
       case 'testing': return 'Testing connection...';
       case 'success': return 'Connected successfully';
       case 'error': return `Error: ${errorMessage}`;
-      default: return 'Ready';
+      default: return currentConfig?.configured ? 'Configured · test to verify' : 'API key needed';
     }
   };
 
@@ -140,7 +138,8 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
       {/* Current Status */}
       {currentConfig && (
         <div className="text-xs text-gray-600 bg-white/40 p-2 rounded">
-          Current: {currentConfig.provider === 'ollama' ? '🏠' : '☁️'} {currentConfig.model}
+          Current: {currentConfig.provider} · {currentConfig.model}
+          {currentConfig.provider !== 'ollama' && <div className="mt-1">Live: {currentConfig.liveModel}</div>}
         </div>
       )}
 
@@ -250,7 +249,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange, onChatOpen
       {/* Help text */}
       <div className="text-xs text-gray-600 space-y-1">
         <div>💡 <strong>Gemini:</strong> Fast, cloud-based, requires API key</div>
-        <div>💡 <strong>Ollama:</strong> Private, local, requires Ollama installation</div>
+        <div>💡 <strong>Ollama:</strong> Local text chat; image, audio and Live features require Gemini</div>
       </div>
     </div>
   );
