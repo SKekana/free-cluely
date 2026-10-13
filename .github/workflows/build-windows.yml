@@ -23,6 +23,9 @@ jobs:
         env:
           SHARP_IGNORE_GLOBAL_LIBVIPS: 1
 
+      - name: Block critical dependency vulnerabilities
+        run: npm audit --audit-level=critical
+
       - name: Check types and unit tests
         run: |
           npm run typecheck

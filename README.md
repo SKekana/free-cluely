@@ -9,7 +9,7 @@ If you’re looking for a hosted desktop recording API, consider checking out [R
 ## 🚀 Quick Start Guide
 
 ### Prerequisites
-- Make sure you have Node.js installed on your computer
+- Use Node.js 24 (or Node.js 22.12+) for the build and test tools.
 - Git installed on your computer  
 - **Either** a Gemini API key (get it from [Google AI Studio](https://makersuite.google.com/app/apikey))
 - **Or** Ollama installed locally for private LLM usage (recommended for privacy)
